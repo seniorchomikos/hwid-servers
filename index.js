@@ -4,7 +4,7 @@ const app = express()
 app.use(express.json())
 
 // Wklej tutaj pobrany plik JSON z Firebase Service Account
-const serviceAccount = require("./serviceAccountKey.json")
+const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON)
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
@@ -37,3 +37,4 @@ const PORT = process.env.PORT || 3000
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`)
 })
+
