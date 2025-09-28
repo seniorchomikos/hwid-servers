@@ -86,5 +86,9 @@ app.post("/verifyDevice", async (req, res) => {
 });
 
 // Render wymaga, aby serwer nasłuchiwał na PORT z env
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`HWID server listening on port ${PORT}`));
+const HOST = '0.0.0.0';
+const PORT = process.env.PORT || 10000;
+
+app.listen(PORT, HOST, () => console.log(`HWID server listening on ${HOST}:${PORT}`));
+
+
