@@ -1,13 +1,14 @@
-// index.js (poprawiona wersja)
+// index.js
 const express = require("express");
 const admin = require("firebase-admin");
 const bodyParser = require("body-parser");
 const fs = require("fs");
 const path = require("path");
 
-// Wczytanie serviceAccountKey.json
+// Wczytanie serviceAccountKey.json lub ENV var
 const serviceAccountPath = path.join(__dirname, "serviceAccountKey.json");
 let serviceAccount = null;
+
 if (fs.existsSync(serviceAccountPath)) {
   serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, "utf8"));
 } else if (process.env.SERVICE_ACCOUNT_JSON) {
@@ -17,6 +18,7 @@ if (fs.existsSync(serviceAccountPath)) {
   process.exit(1);
 }
 
+// Inicjalizacja Firebase Admin SDK
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
@@ -25,11 +27,12 @@ const db = admin.firestore();
 const app = express();
 app.use(bodyParser.json());
 
+// Endpoint weryfikacji urządzenia i zapis email + HWID
 app.post("/verifyDevice", async (req, res) => {
-  const { uid, deviceId } = req.body || {};
+  const { uid, deviceId, email } = req.body || {};
 
-  if (!uid || !deviceId) {
-    return res.status(400).json({ Allowed: false, message: "Missing uid or deviceId" });
+  if (!uid || !deviceId || !email) {
+    return res.status(400).json({ Allowed: false, message: "Missing uid, deviceId or email" });
   }
 
   try {
@@ -44,9 +47,10 @@ app.post("/verifyDevice", async (req, res) => {
     const doc = await userRef.get();
 
     if (!doc.exists) {
-      // Pierwsze logowanie: tworzymy dokument i zapisujemy deviceId
+      // Pierwsze logowanie: tworzymy dokument i zapisujemy deviceId + email
       await userRef.set({
         deviceId: deviceId,
+        email: email,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
       return res.status(200).json({ Allowed: true, message: "Device registered (first login)" });
@@ -54,8 +58,16 @@ app.post("/verifyDevice", async (req, res) => {
 
     const userData = doc.data() || {};
 
+    // Aktualizacja email jeśli się zmienił
+    if (userData.email !== email) {
+      await userRef.update({
+        email: email,
+        lastEmailUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
+
+    // Zapis deviceId jeśli brak
     if (!userData.deviceId) {
-      // Brak zapisanej tablicy deviceId -> zapisujemy
       await userRef.update({
         deviceId: deviceId,
         lastRegisteredAt: admin.firestore.FieldValue.serverTimestamp()
@@ -63,16 +75,17 @@ app.post("/verifyDevice", async (req, res) => {
       return res.status(200).json({ Allowed: true, message: "Device registered" });
     }
 
+    // Sprawdzenie zgodności HWID
     if (userData.deviceId === deviceId) {
-      // Pasuje HWID
       return res.status(200).json({ Allowed: true, message: "Device authorized" });
     }
 
     // Nie pasuje HWID -> blokada
     await admin.auth().revokeRefreshTokens(uid);
-    await db.collection("users").doc(uid).collection("accessLogs").add({
+    await userRef.collection("accessLogs").add({
       type: "unauthorized_device_attempt",
       attemptedDeviceId: deviceId,
+      emailAttempted: email,
       timestamp: admin.firestore.FieldValue.serverTimestamp()
     });
 
@@ -84,6 +97,6 @@ app.post("/verifyDevice", async (req, res) => {
   }
 });
 
-// Bind na 0.0.0.0 i port z Render env
+// Start serwera
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => console.log(`HWID server listening on ${PORT}`));
