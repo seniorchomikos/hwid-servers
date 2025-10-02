@@ -103,7 +103,7 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => console.log(`HWID server listening on ${PORT}`));
 
 // 🔥 KEEP ALIVE PING co 4 minuty
-const SELF_URL = process.env.SELF_URL || `https://twoja-aplikacja-na-render.onrender.com`;
+const SELF_URL = process.env.SELF_URL || `https://hwid-servers.onrender.com/verifyDevice`;
 
 setInterval(async () => {
   try {
@@ -113,3 +113,4 @@ setInterval(async () => {
     console.error(`[KEEP-ALIVE] ${new Date().toISOString()} - Error pinging self:`, err.message);
   }
 }, 4 * 60 * 1000);
+
