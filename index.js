@@ -4,6 +4,7 @@ const admin = require("firebase-admin");
 const bodyParser = require("body-parser");
 const fs = require("fs");
 const path = require("path");
+const fetch = require("node-fetch"); // <--- dodane
 
 // Wczytanie serviceAccountKey.json lub ENV var
 const serviceAccountPath = path.join(__dirname, "serviceAccountKey.json");
@@ -100,3 +101,15 @@ app.post("/verifyDevice", async (req, res) => {
 // Start serwera
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => console.log(`HWID server listening on ${PORT}`));
+
+// 🔥 KEEP ALIVE PING co 4 minuty
+const SELF_URL = process.env.SELF_URL || `https://twoja-aplikacja-na-render.onrender.com`;
+
+setInterval(async () => {
+  try {
+    const resp = await fetch(SELF_URL);
+    console.log(`[KEEP-ALIVE] ${new Date().toISOString()} - Ping status: ${resp.status}`);
+  } catch (err) {
+    console.error(`[KEEP-ALIVE] ${new Date().toISOString()} - Error pinging self:`, err.message);
+  }
+}, 4 * 60 * 1000);
