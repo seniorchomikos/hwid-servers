@@ -1,13 +1,13 @@
-// index.js — licencje: email + licenseKey + HWID, bez UID
+// index.js — wersja z username + licenseKey + HWID
 
 const express = require("express");
 const admin = require("firebase-admin");
 const bodyParser = require("body-parser");
 const fs = require("fs");
 const path = require("path");
-const fetch = require("node-fetch"); // keep-alive ping
+const fetch = require("node-fetch");
 
-// === Poświadczenia Firebase Admin (ENV lub plik) ===
+// 🔸 Wczytaj service account (plik lub ENV)
 const serviceAccountPath = path.join(__dirname, "serviceAccountKey.json");
 let serviceAccount = null;
 
@@ -16,52 +16,31 @@ if (fs.existsSync(serviceAccountPath)) {
 } else if (process.env.SERVICE_ACCOUNT_JSON) {
   serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
 } else {
-  console.error("Brak credentials: dodaj serviceAccountKey.json lub SERVICE_ACCOUNT_JSON env var.");
+  console.error("❌ Brak credentials: dodaj serviceAccountKey.json lub zmienną SERVICE_ACCOUNT_JSON");
   process.exit(1);
 }
 
-// === Inicjalizacja Admin SDK + Firestore ===
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 const db = admin.firestore();
 
-// === App ===
 const app = express();
 app.use(bodyParser.json());
 
-// Healthcheck / keep-alive
+// ✅ Healthcheck
 app.get("/", (req, res) => {
-  res.status(200).send("License server is running ✅");
+  res.status(200).send("License server OK ✅");
 });
 
-// ======================================================================
-//  POST /licenseLogin
-//  Body: { email: string, licenseKey: string, deviceId: string }   (deviceId = HWID)
-//  Logika:
-//   1) Pobierz dokument licenses/{licenseKey}. Jeśli nie ma → 403 "Invalid license key".
-//   2) Jeśli active === false → 403 "License inactive".
-//   3) Jeśli brak hwid → pierwsze logowanie: zapisz hwid, ownerEmail, znaczniki czasu → 200 Allowed.
-//   4) Jeśli hwid == deviceId → update lastLoginAt (+opcjonalnie ownerEmail) → 200 Allowed.
-//   5) Inaczej → 403 "Device mismatch", dopisz log do subkolekcji accessLogs.
-//
-//  Struktura dokumentu licenses/{licenseKey} (przykład):
-//   {
-//     active: true,
-//     hwid?: "MACHINE-GUID...",
-//     ownerEmail?: "kupujacy@domena.pl",
-//     firstActivatedAt?: <timestamp>,
-//     lastLoginAt?: <timestamp>
-//   }
-// ======================================================================
+// ✅ Endpoint logowania
 app.post("/licenseLogin", async (req, res) => {
-  const { email, licenseKey, deviceId } = req.body || {};
+  const { username, licenseKey, deviceId } = req.body || {};
 
-  // Walidacja wejścia
-  if (!email || !licenseKey || !deviceId) {
+  if (!username || !licenseKey || !deviceId) {
     return res.status(400).json({
       Allowed: false,
-      message: "Missing email, licenseKey or deviceId",
+      message: "Missing username, licenseKey or deviceId",
     });
   }
 
@@ -79,7 +58,7 @@ app.post("/licenseLogin", async (req, res) => {
 
     const lic = licSnap.data() || {};
 
-    // Aktywność licencji
+    // 🔸 Sprawdź aktywność
     if (lic.active === false) {
       return res.status(403).json({
         Allowed: false,
@@ -87,12 +66,12 @@ app.post("/licenseLogin", async (req, res) => {
       });
     }
 
-    // Pierwsze logowanie → przypnij HWID do licencji
+    // 🔸 Pierwsze logowanie — przypnij HWID
     if (!lic.hwid) {
       await licRef.set(
         {
           hwid: deviceId,
-          ownerEmail: email,
+          ownerUsername: username,
           firstActivatedAt: admin.firestore.FieldValue.serverTimestamp(),
           lastLoginAt: admin.firestore.FieldValue.serverTimestamp(),
         },
@@ -101,7 +80,7 @@ app.post("/licenseLogin", async (req, res) => {
 
       await licRef.collection("accessLogs").add({
         type: "first_activation",
-        email,
+        username,
         deviceId,
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -112,11 +91,11 @@ app.post("/licenseLogin", async (req, res) => {
       });
     }
 
-    // Kolejne logowania → HWID musi się zgadzać
+    // 🔸 Kolejne logowania — sprawdź HWID
     if (lic.hwid === deviceId) {
       await licRef.set(
         {
-          ownerEmail: email, // aktualizuj (opcjonalnie)
+          ownerUsername: username,
           lastLoginAt: admin.firestore.FieldValue.serverTimestamp(),
         },
         { merge: true }
@@ -128,10 +107,10 @@ app.post("/licenseLogin", async (req, res) => {
       });
     }
 
-    // HWID nie pasuje
+    // 🔸 Inne urządzenie
     await licRef.collection("accessLogs").add({
       type: "hwid_mismatch",
-      email,
+      username,
       attemptedDeviceId: deviceId,
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -146,17 +125,17 @@ app.post("/licenseLogin", async (req, res) => {
   }
 });
 
-// === Start serwera ===
+// ✅ Start serwera
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => console.log(`License server listening on ${PORT}`));
 
-// === KEEP ALIVE co 2 min (np. Render/railway) ===
-const SELF_URL = process.env.SELF_URL || `https://hwid-servers.onrender.com`;
+// ✅ Keep-alive (Render)
+const SELF_URL = process.env.SELF_URL || `https://twoj-serwer.onrender.com`;
 setInterval(async () => {
   try {
     const resp = await fetch(SELF_URL);
-    console.log(`[KEEP-ALIVE] ${new Date().toISOString()} - Ping status: ${resp.status}`);
+    console.log(`[KEEP-ALIVE] ${new Date().toISOString()} - ${resp.status}`);
   } catch (err) {
-    console.error(`[KEEP-ALIVE] ${new Date().toISOString()} - Error pinging self:`, err.message);
+    console.error(`[KEEP-ALIVE] ${new Date().toISOString()} - Error:`, err.message);
   }
 }, 2 * 60 * 1000);
