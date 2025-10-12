@@ -5,7 +5,6 @@ require("dotenv").config();
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
-const fetch = require("node-fetch");
 const admin = require("firebase-admin");
 
 // ---------- Credentials (file or ENV) ----------
@@ -199,3 +198,4 @@ if (SELF_URL) {
     }
   }, 2 * 60 * 1000);
 }
+
