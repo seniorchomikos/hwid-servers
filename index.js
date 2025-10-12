@@ -138,4 +138,5 @@ setInterval(async () => {
   } catch (err) {
     console.error(`[KEEP-ALIVE] ${new Date().toISOString()} - Error:`, err.message);
   }
-}, 2 * 60 * 1000);
+}, 1 * 60 * 1000);
+
