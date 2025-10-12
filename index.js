@@ -1,13 +1,14 @@
-// index.js — wersja z username + licenseKey + HWID
+// index.js — License backend: username + licenseKey + HWID + duration (HAMSTER-<ND>-...)
+// Node 18+, Express, Firebase Admin
 
+require("dotenv").config();
 const express = require("express");
-const admin = require("firebase-admin");
-const bodyParser = require("body-parser");
 const fs = require("fs");
 const path = require("path");
 const fetch = require("node-fetch");
+const admin = require("firebase-admin");
 
-// 🔸 Wczytaj service account (plik lub ENV)
+// ---------- Credentials (file or ENV) ----------
 const serviceAccountPath = path.join(__dirname, "serviceAccountKey.json");
 let serviceAccount = null;
 
@@ -16,24 +17,38 @@ if (fs.existsSync(serviceAccountPath)) {
 } else if (process.env.SERVICE_ACCOUNT_JSON) {
   serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
 } else {
-  console.error("❌ Brak credentials: dodaj serviceAccountKey.json lub zmienną SERVICE_ACCOUNT_JSON");
+  console.error("❌ Brak credentials: dodaj serviceAccountKey.json albo ustaw SERVICE_ACCOUNT_JSON.");
   process.exit(1);
 }
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
+// ---------- App ----------
 const app = express();
-app.use(bodyParser.json());
+app.use(express.json());
 
-// ✅ Healthcheck
+// Healthcheck
 app.get("/", (req, res) => {
   res.status(200).send("License server OK ✅");
 });
 
-// ✅ Endpoint logowania
+// Helpers
+function parseDurationDaysFromKey(licenseKey) {
+  // dopasowuje np. HAMSTER-7D-XXXX, HAMSTER-30D-XXXX, HAMSTER-90D-XXXX
+  const m = /^HAMSTER-(\d+)D-/i.exec(String(licenseKey || "").trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function toDate(val) {
+  // Firestore Timestamp -> Date
+  if (!val) return null;
+  return typeof val.toDate === "function" ? val.toDate() : new Date(val);
+}
+
+// ---------- Main endpoint ----------
 app.post("/licenseLogin", async (req, res) => {
   const { username, licenseKey, deviceId } = req.body || {};
 
@@ -58,7 +73,7 @@ app.post("/licenseLogin", async (req, res) => {
 
     const lic = licSnap.data() || {};
 
-    // 🔸 Sprawdź aktywność
+    // 1) aktywność
     if (lic.active === false) {
       return res.status(403).json({
         Allowed: false,
@@ -66,14 +81,38 @@ app.post("/licenseLogin", async (req, res) => {
       });
     }
 
-    // 🔸 Pierwsze logowanie — przypnij HWID
+    // 2) okres ważności na podstawie prefiksu HAMSTER-<ND>-
+    const days = parseDurationDaysFromKey(key);
+    if (days) {
+      // jeśli mamy activatedAt, licz datę wygaśnięcia i sprawdź
+      const activatedAt = toDate(lic.activatedAt || lic.firstActivatedAt);
+      if (activatedAt) {
+        const expiresAt = new Date(activatedAt.getTime());
+        expiresAt.setDate(expiresAt.getDate() + days);
+
+        if (new Date() > expiresAt) {
+          // możesz też dezaktywować dokument
+          await licRef.set({ active: false, expiredAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+          return res.status(403).json({
+            Allowed: false,
+            message: `License expired after ${days} days`,
+            expiresAt: expiresAt.toISOString(),
+          });
+        }
+      }
+    }
+
+    // 3) pierwsze logowanie -> przypnij HWID i zapisz activatedAt
     if (!lic.hwid) {
+      const now = admin.firestore.FieldValue.serverTimestamp();
       await licRef.set(
         {
           hwid: deviceId,
           ownerUsername: username,
-          firstActivatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          lastLoginAt: admin.firestore.FieldValue.serverTimestamp(),
+          activatedAt: lic.activatedAt || now, // ustaw tylko raz
+          firstActivatedAt: lic.firstActivatedAt || now,
+          lastLoginAt: now,
+          durationDays: lic.durationDays || days || null, // informacyjnie
         },
         { merge: true }
       );
@@ -82,32 +121,51 @@ app.post("/licenseLogin", async (req, res) => {
         type: "first_activation",
         username,
         deviceId,
-        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        timestamp: now,
       });
+
+      // policz expiresAt do odpowiedzi (jeśli znamy days)
+      let expiresAtISO = null;
+      if (days) {
+        const start = new Date();
+        const a = toDate(lic.activatedAt) || start;
+        const ex = new Date(a.getTime());
+        ex.setDate(ex.getDate() + days);
+        expiresAtISO = ex.toISOString();
+      }
 
       return res.status(200).json({
         Allowed: true,
         message: "License bound to this device (first login)",
+        durationDays: days || null,
+        expiresAt: expiresAtISO,
       });
     }
 
-    // 🔸 Kolejne logowania — sprawdź HWID
+    // 4) kolejne logowania -> HWID musi pasować
     if (lic.hwid === deviceId) {
       await licRef.set(
-        {
-          ownerUsername: username,
-          lastLoginAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
+        { ownerUsername: username, lastLoginAt: admin.firestore.FieldValue.serverTimestamp() },
         { merge: true }
       );
+
+      // (opcjonalnie) policz expiresAt do odpowiedzi
+      let expiresAtISO = null;
+      if (days && lic.activatedAt) {
+        const ex = new Date(toDate(lic.activatedAt).getTime());
+        ex.setDate(ex.getDate() + days);
+        expiresAtISO = ex.toISOString();
+      }
 
       return res.status(200).json({
         Allowed: true,
         message: "Login OK",
+        durationDays: days || null,
+        expiresAt: expiresAtISO,
       });
     }
 
-    // 🔸 Inne urządzenie
+    // 5) inne urządzenie
     await licRef.collection("accessLogs").add({
       type: "hwid_mismatch",
       username,
@@ -125,18 +183,19 @@ app.post("/licenseLogin", async (req, res) => {
   }
 });
 
-// ✅ Start serwera
+// ---------- Start ----------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => console.log(`License server listening on ${PORT}`));
 
-// ✅ Keep-alive (Render)
-const SELF_URL = process.env.SELF_URL || `https://twoj-serwer.onrender.com`;
-setInterval(async () => {
-  try {
-    const resp = await fetch(SELF_URL);
-    console.log(`[KEEP-ALIVE] ${new Date().toISOString()} - ${resp.status}`);
-  } catch (err) {
-    console.error(`[KEEP-ALIVE] ${new Date().toISOString()} - Error:`, err.message);
-  }
-}, 1 * 60 * 1000);
-
+// ---------- Keep-alive (Render / Railway) ----------
+const SELF_URL = process.env.SELF_URL || "";
+if (SELF_URL) {
+  setInterval(async () => {
+    try {
+      const r = await fetch(SELF_URL);
+      console.log(`[KEEP-ALIVE] ${new Date().toISOString()} status=${r.status}`);
+    } catch (e) {
+      console.error(`[KEEP-ALIVE] ${new Date().toISOString()} error=${e.message}`);
+    }
+  }, 2 * 60 * 1000);
+}
