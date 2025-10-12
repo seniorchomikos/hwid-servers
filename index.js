@@ -1,4 +1,7 @@
-// index.js — License backend z okresem ważności i stałym keep-alive URL
+// index.js — License backend: username + licenseKey + HWID + duration (HAMSTER-<ND>-...)
+// - wymuszenie tego samego username przy kolejnych logowaniach
+// - zwracanie expiresAt przy sukcesie
+// - keep-alive z wpisanym na sztywno URL-em
 
 const express = require("express");
 const fs = require("fs");
@@ -21,7 +24,7 @@ if (fs.existsSync(serviceAccountPath)) {
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-// ============ App setup ============
+// ============ App ============
 const app = express();
 app.use(express.json());
 
@@ -37,58 +40,50 @@ function parseDurationDaysFromKey(licenseKey) {
   const n = parseInt(m[1], 10);
   return Number.isFinite(n) && n > 0 ? n : null;
 }
-
 function toDate(val) {
   if (!val) return null;
   return typeof val.toDate === "function" ? val.toDate() : new Date(val);
+}
+function calcExpiresAtISO(activatedAt, days) {
+  if (!activatedAt || !days) return null;
+  const base = toDate(activatedAt);
+  if (!base || isNaN(base.getTime())) return null;
+  const ex = new Date(base.getTime());
+  ex.setDate(ex.getDate() + days);
+  return ex.toISOString();
 }
 
 // ============ License Login ============
 app.post("/licenseLogin", async (req, res) => {
   const { username, licenseKey, deviceId } = req.body || {};
-
   if (!username || !licenseKey || !deviceId) {
-    return res.status(400).json({
-      Allowed: false,
-      message: "Missing username, licenseKey or deviceId",
-    });
+    return res.status(400).json({ Allowed: false, message: "Missing username, licenseKey or deviceId" });
   }
 
   const key = String(licenseKey).trim();
   const licRef = db.collection("licenses").doc(key);
 
   try {
-    const licSnap = await licRef.get();
-    if (!licSnap.exists) {
-      return res.status(403).json({
-        Allowed: false,
-        message: "Invalid license key",
-      });
+    const snap = await licRef.get();
+    if (!snap.exists) {
+      return res.status(403).json({ Allowed: false, message: "Invalid license key" });
     }
+    const lic = snap.data() || {};
 
-    const lic = licSnap.data() || {};
-
-    // 1️⃣ Sprawdzenie aktywności
+    // 1) aktywność
     if (lic.active === false) {
-      return res.status(403).json({
-        Allowed: false,
-        message: "License inactive",
-      });
+      return res.status(403).json({ Allowed: false, message: "License inactive" });
     }
 
-    // 2️⃣ Sprawdzenie okresu ważności z prefixu
+    // 2) ważność na podstawie prefiksu
     const days = parseDurationDaysFromKey(key);
     if (days) {
       const activatedAt = toDate(lic.activatedAt || lic.firstActivatedAt);
       if (activatedAt) {
         const expiresAt = new Date(activatedAt.getTime());
         expiresAt.setDate(expiresAt.getDate() + days);
-
         if (new Date() > expiresAt) {
-          await licRef.set(
-            { active: false, expiredAt: admin.firestore.FieldValue.serverTimestamp() },
-            { merge: true }
-          );
+          await licRef.set({ active: false, expiredAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
           return res.status(403).json({
             Allowed: false,
             message: `License expired after ${days} days`,
@@ -98,13 +93,13 @@ app.post("/licenseLogin", async (req, res) => {
       }
     }
 
-    // 3️⃣ Pierwsze logowanie — przypnij HWID i username
+    // 3) Pierwsze logowanie — brak HWID => przypnij HWID i username
     if (!lic.hwid) {
       const now = admin.firestore.FieldValue.serverTimestamp();
       await licRef.set(
         {
           hwid: deviceId,
-          ownerUsername: username,
+          ownerUsername: username,         // zapisujemy właściciela tylko raz
           activatedAt: lic.activatedAt || now,
           firstActivatedAt: lic.firstActivatedAt || now,
           lastLoginAt: now,
@@ -120,38 +115,53 @@ app.post("/licenseLogin", async (req, res) => {
         timestamp: now,
       });
 
+      // policz expiresAt na odpowiedź
+      const expiresAtISO = calcExpiresAtISO(lic.activatedAt || new Date(), days);
+
       return res.status(200).json({
         Allowed: true,
         message: "License bound to this device (first login)",
         durationDays: days || null,
+        expiresAt: expiresAtISO,
       });
     }
 
-    // 4️⃣ Kolejne logowania — HWID musi pasować
-    if (lic.hwid === deviceId) {
-      await licRef.set(
-        { ownerUsername: username, lastLoginAt: admin.firestore.FieldValue.serverTimestamp() },
-        { merge: true }
-      );
-
-      return res.status(200).json({
-        Allowed: true,
-        message: "Login OK",
-        durationDays: days || null,
+    // 4) HWID przypięty — musi pasować
+    if (lic.hwid !== deviceId) {
+      await licRef.collection("accessLogs").add({
+        type: "hwid_mismatch",
+        username,
+        attemptedDeviceId: deviceId,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
       });
+      return res.status(403).json({ Allowed: false, message: "Device mismatch" });
     }
 
-    // 5️⃣ Inne urządzenie
-    await licRef.collection("accessLogs").add({
-      type: "hwid_mismatch",
-      username,
-      attemptedDeviceId: deviceId,
-      timestamp: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    // 5) HWID pasuje — username musi być TEN SAM (nie nadpisujemy!)
+    if (lic.ownerUsername && lic.ownerUsername !== username) {
+      await licRef.collection("accessLogs").add({
+        type: "username_mismatch",
+        usernameAttempt: username,
+        ownerUsername: lic.ownerUsername,
+        deviceId,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return res.status(403).json({ Allowed: false, message: "Username mismatch" });
+    }
 
-    return res.status(403).json({
-      Allowed: false,
-      message: "Device mismatch",
+    // 6) OK — aktualizuj tylko lastLoginAt (NIE zmieniaj ownerUsername)
+    await licRef.set(
+      { lastLoginAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+
+    const expiresAtISO = calcExpiresAtISO(lic.activatedAt || lic.firstActivatedAt, days);
+
+    return res.status(200).json({
+      Allowed: true,
+      message: "Login OK",
+      durationDays: days || null,
+      expiresAt: expiresAtISO,
     });
   } catch (err) {
     console.error("licenseLogin error:", err);
@@ -159,21 +169,19 @@ app.post("/licenseLogin", async (req, res) => {
   }
 });
 
-// ============ Start serwera ============
+// ============ Start ============
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => console.log(`License server listening on ${PORT}`));
 
 // ============ Keep-alive (STAŁY URL w kodzie) ============
-
-// 👇 Tutaj wpisz swój URL aplikacji
+// 👇 Tutaj wpisz swój(e) publiczny(e) URL(e)
 const KEEPALIVE_URLS = [
   "https://hwid-servers.onrender.com"
 ];
+const KEEPALIVE_INTERVAL_MS = 2 * 60 * 1000; // co 2 min
+const KEEPALIVE_TIMEOUT_MS = 5000;           // 5s
 
-const KEEPALIVE_INTERVAL_MS = 2 * 60 * 1000; // co 2 minuty
-const KEEPALIVE_TIMEOUT_MS = 5000;          // timeout pojedynczego pinga
-
-// Pomocniczy endpoint do testów
+// pomocniczy endpoint do testów
 app.get("/keepalive", (req, res) => {
   res.status(200).json({ ok: true, ts: new Date().toISOString() });
 });
@@ -182,7 +190,6 @@ async function pingOnce(url) {
   try {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), KEEPALIVE_TIMEOUT_MS);
-
     let r = await fetch(url, { method: "HEAD", signal: controller.signal });
     clearTimeout(t);
 
@@ -192,7 +199,6 @@ async function pingOnce(url) {
       r = await fetch(url, { method: "GET", signal: controller2.signal });
       clearTimeout(t2);
     }
-
     console.log(`[KEEP-ALIVE] ${new Date().toISOString()} ${url} -> ${r.status}`);
   } catch (e) {
     console.error(`[KEEP-ALIVE] ${new Date().toISOString()} ${url} -> ERROR: ${e.message}`);
@@ -200,19 +206,9 @@ async function pingOnce(url) {
 }
 
 if (KEEPALIVE_URLS.length > 0 && typeof fetch !== "undefined") {
-  console.log(
-    `[KEEP-ALIVE] enabled (hardcoded): ${KEEPALIVE_URLS.join(", ")} | interval=${KEEPALIVE_INTERVAL_MS}ms timeout=${KEEPALIVE_TIMEOUT_MS}ms`
-  );
-
-  // pierwszy ping od razu po starcie
-  (async () => {
-    for (const u of KEEPALIVE_URLS) await pingOnce(u);
-  })();
-
-  // kolejne pingowanie w interwałach
-  setInterval(() => {
-    KEEPALIVE_URLS.forEach(u => pingOnce(u));
-  }, KEEPALIVE_INTERVAL_MS);
+  console.log(`[KEEP-ALIVE] enabled (hardcoded): ${KEEPALIVE_URLS.join(", ")} | interval=${KEEPALIVE_INTERVAL_MS}ms`);
+  (async () => { for (const u of KEEPALIVE_URLS) await pingOnce(u); })();
+  setInterval(() => { KEEPALIVE_URLS.forEach(u => pingOnce(u)); }, KEEPALIVE_INTERVAL_MS);
 } else {
   console.log("[KEEP-ALIVE] disabled (no URLs provided)");
 }
