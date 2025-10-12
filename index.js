@@ -1,13 +1,11 @@
-// index.js — License backend: username + licenseKey + HWID + duration (HAMSTER-<ND>-...)
-// Node 18+, Express, Firebase Admin
+// index.js — License backend z obsługą okresu ważności i konfigurowalnym keep-alive
 
-require("dotenv").config();
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const admin = require("firebase-admin");
 
-// ---------- Credentials (file or ENV) ----------
+// ============ Firebase credentials ============
 const serviceAccountPath = path.join(__dirname, "serviceAccountKey.json");
 let serviceAccount = null;
 
@@ -23,18 +21,17 @@ if (fs.existsSync(serviceAccountPath)) {
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-// ---------- App ----------
+// ============ App setup ============
 const app = express();
 app.use(express.json());
 
-// Healthcheck
+// Healthcheck endpoint
 app.get("/", (req, res) => {
   res.status(200).send("License server OK ✅");
 });
 
-// Helpers
+// ============ Helpers ============
 function parseDurationDaysFromKey(licenseKey) {
-  // dopasowuje np. HAMSTER-7D-XXXX, HAMSTER-30D-XXXX, HAMSTER-90D-XXXX
   const m = /^HAMSTER-(\d+)D-/i.exec(String(licenseKey || "").trim());
   if (!m) return null;
   const n = parseInt(m[1], 10);
@@ -42,12 +39,11 @@ function parseDurationDaysFromKey(licenseKey) {
 }
 
 function toDate(val) {
-  // Firestore Timestamp -> Date
   if (!val) return null;
   return typeof val.toDate === "function" ? val.toDate() : new Date(val);
 }
 
-// ---------- Main endpoint ----------
+// ============ License Login ============
 app.post("/licenseLogin", async (req, res) => {
   const { username, licenseKey, deviceId } = req.body || {};
 
@@ -72,7 +68,7 @@ app.post("/licenseLogin", async (req, res) => {
 
     const lic = licSnap.data() || {};
 
-    // 1) aktywność
+    // 1️⃣ Sprawdzenie aktywności
     if (lic.active === false) {
       return res.status(403).json({
         Allowed: false,
@@ -80,17 +76,15 @@ app.post("/licenseLogin", async (req, res) => {
       });
     }
 
-    // 2) okres ważności na podstawie prefiksu HAMSTER-<ND>-
+    // 2️⃣ Sprawdzenie okresu ważności z prefixu
     const days = parseDurationDaysFromKey(key);
     if (days) {
-      // jeśli mamy activatedAt, licz datę wygaśnięcia i sprawdź
       const activatedAt = toDate(lic.activatedAt || lic.firstActivatedAt);
       if (activatedAt) {
         const expiresAt = new Date(activatedAt.getTime());
         expiresAt.setDate(expiresAt.getDate() + days);
 
         if (new Date() > expiresAt) {
-          // możesz też dezaktywować dokument
           await licRef.set({ active: false, expiredAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
           return res.status(403).json({
             Allowed: false,
@@ -101,17 +95,17 @@ app.post("/licenseLogin", async (req, res) => {
       }
     }
 
-    // 3) pierwsze logowanie -> przypnij HWID i zapisz activatedAt
+    // 3️⃣ Pierwsze logowanie — przypnij HWID i username
     if (!lic.hwid) {
       const now = admin.firestore.FieldValue.serverTimestamp();
       await licRef.set(
         {
           hwid: deviceId,
           ownerUsername: username,
-          activatedAt: lic.activatedAt || now, // ustaw tylko raz
+          activatedAt: lic.activatedAt || now,
           firstActivatedAt: lic.firstActivatedAt || now,
           lastLoginAt: now,
-          durationDays: lic.durationDays || days || null, // informacyjnie
+          durationDays: lic.durationDays || days || null,
         },
         { merge: true }
       );
@@ -123,48 +117,28 @@ app.post("/licenseLogin", async (req, res) => {
         timestamp: now,
       });
 
-      // policz expiresAt do odpowiedzi (jeśli znamy days)
-      let expiresAtISO = null;
-      if (days) {
-        const start = new Date();
-        const a = toDate(lic.activatedAt) || start;
-        const ex = new Date(a.getTime());
-        ex.setDate(ex.getDate() + days);
-        expiresAtISO = ex.toISOString();
-      }
-
       return res.status(200).json({
         Allowed: true,
         message: "License bound to this device (first login)",
         durationDays: days || null,
-        expiresAt: expiresAtISO,
       });
     }
 
-    // 4) kolejne logowania -> HWID musi pasować
+    // 4️⃣ Kolejne logowania — HWID musi pasować
     if (lic.hwid === deviceId) {
       await licRef.set(
         { ownerUsername: username, lastLoginAt: admin.firestore.FieldValue.serverTimestamp() },
         { merge: true }
       );
 
-      // (opcjonalnie) policz expiresAt do odpowiedzi
-      let expiresAtISO = null;
-      if (days && lic.activatedAt) {
-        const ex = new Date(toDate(lic.activatedAt).getTime());
-        ex.setDate(ex.getDate() + days);
-        expiresAtISO = ex.toISOString();
-      }
-
       return res.status(200).json({
         Allowed: true,
         message: "Login OK",
         durationDays: days || null,
-        expiresAt: expiresAtISO,
       });
     }
 
-    // 5) inne urządzenie
+    // 5️⃣ Inne urządzenie
     await licRef.collection("accessLogs").add({
       type: "hwid_mismatch",
       username,
@@ -182,20 +156,65 @@ app.post("/licenseLogin", async (req, res) => {
   }
 });
 
-// ---------- Start ----------
+// ============ Start serwera ============
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => console.log(`License server listening on ${PORT}`));
 
-// ---------- Keep-alive (Render / Railway) ----------
-const SELF_URL = process.env.SELF_URL || "";
-if (SELF_URL) {
-  setInterval(async () => {
-    try {
-      const r = await fetch(SELF_URL);
-      console.log(`[KEEP-ALIVE] ${new Date().toISOString()} status=${r.status}`);
-    } catch (e) {
-      console.error(`[KEEP-ALIVE] ${new Date().toISOString()} error=${e.message}`);
+// ============ Keep-alive (własny URL) ============
+/*
+  Konfiguracja:
+  - KEEPALIVE_URLS           - lista URL-i rozdzielona przecinkami (np. "https://twoj-projekt.onrender.com")
+  - KEEPALIVE_INTERVAL_MS    - interwał pinga (domyślnie 120000 ms = 2 min)
+  - KEEPALIVE_TIMEOUT_MS     - timeout jednego pinga (domyślnie 5000 ms)
+*/
+
+const urlsRaw = process.env.KEEPALIVE_URLS || process.env.SELF_URL || "";
+const KEEPALIVE_URLS = urlsRaw
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const KEEPALIVE_INTERVAL_MS = Number(process.env.KEEPALIVE_INTERVAL_MS || 120000);
+const KEEPALIVE_TIMEOUT_MS = Number(process.env.KEEPALIVE_TIMEOUT_MS || 5000);
+
+// pomocniczy endpoint do testu
+app.get("/keepalive", (req, res) => {
+  res.status(200).json({ ok: true, ts: new Date().toISOString() });
+});
+
+async function pingOnce(url) {
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), KEEPALIVE_TIMEOUT_MS);
+
+    let r = await fetch(url, { method: "HEAD", signal: controller.signal });
+    clearTimeout(t);
+
+    if (!r.ok || r.status === 405) {
+      const controller2 = new AbortController();
+      const t2 = setTimeout(() => controller2.abort(), KEEPALIVE_TIMEOUT_MS);
+      r = await fetch(url, { method: "GET", signal: controller2.signal });
+      clearTimeout(t2);
     }
-  }, 2 * 60 * 1000);
+
+    console.log(`[KEEP-ALIVE] ${new Date().toISOString()} ${url} -> ${r.status}`);
+  } catch (e) {
+    console.error(`[KEEP-ALIVE] ${new Date().toISOString()} ${url} -> ERROR: ${e.message}`);
+  }
 }
 
+if (KEEPALIVE_URLS.length > 0 && typeof fetch !== "undefined") {
+  console.log(
+    `[KEEP-ALIVE] enabled: ${KEEPALIVE_URLS.join(", ")} | interval=${KEEPALIVE_INTERVAL_MS}ms timeout=${KEEPALIVE_TIMEOUT_MS}ms`
+  );
+
+  (async () => {
+    for (const u of KEEPALIVE_URLS) await pingOnce(u);
+  })();
+
+  setInterval(() => {
+    KEEPALIVE_URLS.forEach(u => pingOnce(u));
+  }, KEEPALIVE_INTERVAL_MS);
+} else {
+  console.log("[KEEP-ALIVE] disabled (set KEEPALIVE_URLS or SELF_URL to enable)");
+}
