@@ -1,4 +1,4 @@
-// index.js — License backend z obsługą okresu ważności i konfigurowalnym keep-alive
+// index.js — License backend z okresem ważności i stałym keep-alive URL
 
 const express = require("express");
 const fs = require("fs");
@@ -25,7 +25,7 @@ const db = admin.firestore();
 const app = express();
 app.use(express.json());
 
-// Healthcheck endpoint
+// Healthcheck
 app.get("/", (req, res) => {
   res.status(200).send("License server OK ✅");
 });
@@ -85,7 +85,10 @@ app.post("/licenseLogin", async (req, res) => {
         expiresAt.setDate(expiresAt.getDate() + days);
 
         if (new Date() > expiresAt) {
-          await licRef.set({ active: false, expiredAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+          await licRef.set(
+            { active: false, expiredAt: admin.firestore.FieldValue.serverTimestamp() },
+            { merge: true }
+          );
           return res.status(403).json({
             Allowed: false,
             message: `License expired after ${days} days`,
@@ -160,24 +163,17 @@ app.post("/licenseLogin", async (req, res) => {
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => console.log(`License server listening on ${PORT}`));
 
-// ============ Keep-alive (własny URL) ============
-/*
-  Konfiguracja:
-  - KEEPALIVE_URLS           - lista URL-i rozdzielona przecinkami (np. "https://twoj-projekt.onrender.com")
-  - KEEPALIVE_INTERVAL_MS    - interwał pinga (domyślnie 120000 ms = 2 min)
-  - KEEPALIVE_TIMEOUT_MS     - timeout jednego pinga (domyślnie 5000 ms)
-*/
+// ============ Keep-alive (STAŁY URL w kodzie) ============
 
-const urlsRaw = process.env.KEEPALIVE_URLS || process.env.SELF_URL || "";
-const KEEPALIVE_URLS = urlsRaw
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
+// 👇 Tutaj wpisz swój URL aplikacji
+const KEEPALIVE_URLS = [
+  "https://hwid-servers.onrender.com"
+];
 
-const KEEPALIVE_INTERVAL_MS = Number(process.env.KEEPALIVE_INTERVAL_MS || 120000);
-const KEEPALIVE_TIMEOUT_MS = Number(process.env.KEEPALIVE_TIMEOUT_MS || 5000);
+const KEEPALIVE_INTERVAL_MS = 2 * 60 * 1000; // co 2 minuty
+const KEEPALIVE_TIMEOUT_MS = 5000;          // timeout pojedynczego pinga
 
-// pomocniczy endpoint do testu
+// Pomocniczy endpoint do testów
 app.get("/keepalive", (req, res) => {
   res.status(200).json({ ok: true, ts: new Date().toISOString() });
 });
@@ -205,16 +201,18 @@ async function pingOnce(url) {
 
 if (KEEPALIVE_URLS.length > 0 && typeof fetch !== "undefined") {
   console.log(
-    `[KEEP-ALIVE] enabled: ${KEEPALIVE_URLS.join(", ")} | interval=${KEEPALIVE_INTERVAL_MS}ms timeout=${KEEPALIVE_TIMEOUT_MS}ms`
+    `[KEEP-ALIVE] enabled (hardcoded): ${KEEPALIVE_URLS.join(", ")} | interval=${KEEPALIVE_INTERVAL_MS}ms timeout=${KEEPALIVE_TIMEOUT_MS}ms`
   );
 
+  // pierwszy ping od razu po starcie
   (async () => {
     for (const u of KEEPALIVE_URLS) await pingOnce(u);
   })();
 
+  // kolejne pingowanie w interwałach
   setInterval(() => {
     KEEPALIVE_URLS.forEach(u => pingOnce(u));
   }, KEEPALIVE_INTERVAL_MS);
 } else {
-  console.log("[KEEP-ALIVE] disabled (set KEEPALIVE_URLS or SELF_URL to enable)");
+  console.log("[KEEP-ALIVE] disabled (no URLs provided)");
 }
