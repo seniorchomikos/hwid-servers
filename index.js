@@ -257,3 +257,42 @@ app.post("/user/login", async (req, res) => {
 // ============ Start ============
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => console.log(`Server listening on ${PORT}`));
+
+// ============ Keep-alive ============
+const KEEPALIVE_URLS = [
+  "https://hwid-servers.onrender.com"
+];
+const KEEPALIVE_INTERVAL_MS = 2 * 60 * 1000;
+const KEEPALIVE_TIMEOUT_MS = 5000;
+
+app.get("/keepalive", (req, res) => {
+  res.status(200).json({ ok: true, ts: new Date().toISOString() });
+});
+
+async function pingOnce(url) {
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), KEEPALIVE_TIMEOUT_MS);
+    let r = await fetch(url, { method: "HEAD", signal: controller.signal });
+    clearTimeout(t);
+    if (!r.ok || r.status === 405) {
+      const controller2 = new AbortController();
+      const t2 = setTimeout(() => controller2.abort(), KEEPALIVE_TIMEOUT_MS);
+      r = await fetch(url, { method: "GET", signal: controller2.signal });
+      clearTimeout(t2);
+    }
+    console.log(`[KEEP-ALIVE] ${new Date().toISOString()} ${url} -> ${r.status}`);
+  } catch (e) {
+    console.error(`[KEEP-ALIVE] ${new Date().toISOString()} ${url} -> ERROR: ${e.message}`);
+  }
+}
+
+if (KEEPALIVE_URLS.length > 0 && typeof fetch !== "undefined") {
+  console.log(`[KEEP-ALIVE] enabled: ${KEEPALIVE_URLS.join(", ")} | interval=${KEEPALIVE_INTERVAL_MS}ms`);
+  (async () => { for (const u of KEEPALIVE_URLS) await pingOnce(u); })();
+  setInterval(() => { KEEPALIVE_URLS.forEach(u => pingOnce(u)); }, KEEPALIVE_INTERVAL_MS);
+} else {
+  console.log("[KEEP-ALIVE] disabled (no URLs provided)");
+}
+
+
