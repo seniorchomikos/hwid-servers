@@ -1,8 +1,9 @@
-// index.js — License backend z expiresAt w Firestore, username lock i keep-alive
+// index.js — Backend: licencje + rejestracja/logowanie użytkowników (Firestore + Render)
 
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
+const bcrypt = require("bcryptjs");
 const admin = require("firebase-admin");
 
 // ============ Firebase credentials ============
@@ -37,10 +38,12 @@ function parseDurationDaysFromKey(licenseKey) {
   const n = parseInt(m[1], 10);
   return Number.isFinite(n) && n > 0 ? n : null;
 }
+
 function toDate(val) {
   if (!val) return null;
   return typeof val.toDate === "function" ? val.toDate() : new Date(val);
 }
+
 function calcExpiresAt(activatedAt, days) {
   if (!activatedAt || !days) return null;
   const base = toDate(activatedAt);
@@ -50,7 +53,9 @@ function calcExpiresAt(activatedAt, days) {
   return ex;
 }
 
-// ============ License Login ============
+// ============ /licenseLogin ============
+// - 1. pierwsze logowanie: przypina HWID + ownerUsername; ustawia expiresAt
+// - 2. kolejne logowania: sprawdza HWID/username oraz ważność licencji
 app.post("/licenseLogin", async (req, res) => {
   const { username, licenseKey, deviceId } = req.body || {};
   if (!username || !licenseKey || !deviceId) {
@@ -90,9 +95,9 @@ app.post("/licenseLogin", async (req, res) => {
     // 3) Pierwsze logowanie — przypnij HWID, zapisz username, duration i expiresAt
     if (!lic.hwid) {
       const now = admin.firestore.Timestamp.now();
-      let calcExpires = null;
+      let calcExDate = null;
       if (days) {
-        calcExpires = calcExpiresAt(new Date(), days);
+        calcExDate = calcExpiresAt(new Date(), days);
       }
 
       await licRef.set(
@@ -103,7 +108,7 @@ app.post("/licenseLogin", async (req, res) => {
           firstActivatedAt: now,
           lastLoginAt: now,
           durationDays: days || null,
-          expiresAt: calcExpires ? admin.firestore.Timestamp.fromDate(calcExpires) : null,
+          expiresAt: calcExDate ? admin.firestore.Timestamp.fromDate(calcExDate) : null,
         },
         { merge: true }
       );
@@ -119,7 +124,7 @@ app.post("/licenseLogin", async (req, res) => {
         Allowed: true,
         message: "License bound to this device (first login)",
         durationDays: days || null,
-        expiresAt: calcExpires ? calcExpires.toISOString() : null,
+        expiresAt: calcExDate ? calcExDate.toISOString() : null,
       });
     }
 
@@ -167,11 +172,122 @@ app.post("/licenseLogin", async (req, res) => {
   }
 });
 
+// ============ Users (Firestore) ============
+function usersRef() { return db.collection("users"); }
+
+// /user/register  — body: { username, password, deviceId, licenseKey }
+// 1) sprawdza licencję przez /licenseLogin (pierwsza aktywacja przypnie HWID+username)
+// 2) zakłada użytkownika (username lowercase) i zapisuje bcrypt hash hasła
+app.post("/user/register", async (req, res) => {
+  const { username, password, deviceId, licenseKey } = req.body || {};
+  if (!username || !password || !deviceId || !licenseKey) {
+    return res.status(400).json({ ok: false, message: "missing_fields" });
+  }
+
+  const usernameId = String(username).toLowerCase();
+  const uref = usersRef().doc(usernameId);
+  const usnap = await uref.get();
+  if (usnap.exists) {
+    return res.status(409).json({ ok: false, message: "username_taken" });
+  }
+
+  // sprawdź/aktywuj licencję (to też przypnie HWID przy 1. razie)
+  const licResp = await fetch(`${process.env.PUBLIC_BASE_URL || ""}/licenseLogin`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username, licenseKey, deviceId }),
+  }).catch(() => null);
+
+  if (!licResp) return res.status(502).json({ ok:false, message:"license_server_unreachable" });
+
+  const licJson = await licResp.json().catch(() => ({}));
+  if (!licResp.ok || !licJson.Allowed) {
+    // mapowanie na Twoje komunikaty w kliencie
+    if ((licJson.message || "").toLowerCase().includes("expired")) {
+      return res.status(403).json({ ok:false, message:"license_expired" });
+    }
+    if ((licJson.message || "").toLowerCase().includes("device mismatch")) {
+      return res.status(403).json({ ok:false, message:"hwid_mismatch" });
+    }
+    if ((licJson.message || "").toLowerCase().includes("username mismatch")) {
+      return res.status(403).json({ ok:false, message:"username_invalid" });
+    }
+    return res.status(403).json({ ok:false, message:"license_invalid" });
+  }
+
+  const hash = await bcrypt.hash(password, 10);
+  await uref.set({
+    username,
+    passHash: hash,
+    hwid: deviceId,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    licenseKey
+  });
+
+  return res.json({ ok: true });
+});
+
+// /user/login — body: { username, password, deviceId }
+// Sprawdza username, hasło (bcrypt), HWID, potem status licencji przez /licenseLogin
+app.post("/user/login", async (req, res) => {
+  const { username, password, deviceId } = req.body || {};
+  if (!username || !password || !deviceId) {
+    return res.status(400).json({ ok: false, message: "missing_fields" });
+  }
+
+  const uref = usersRef().doc(String(username).toLowerCase());
+  const usnap = await uref.get();
+  if (!usnap.exists) {
+    return res.status(403).json({ ok:false, message:"username_invalid" });
+  }
+  const user = usnap.data();
+
+  // username/hwid spójność
+  if (user.username !== username) {
+    return res.status(403).json({ ok:false, message:"username_invalid" });
+  }
+  if (user.hwid !== deviceId) {
+    return res.status(403).json({ ok:false, message:"hwid_mismatch" });
+  }
+
+  const ok = await bcrypt.compare(password, user.passHash || "");
+  if (!ok) {
+    return res.status(403).json({ ok:false, message:"password_invalid" });
+  }
+
+  // sprawdź ważność licencji
+  const licResp = await fetch(`${process.env.PUBLIC_BASE_URL || ""}/licenseLogin`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username, licenseKey: user.licenseKey, deviceId }),
+  }).catch(() => null);
+
+  if (!licResp) return res.status(502).json({ ok:false, message:"license_server_unreachable" });
+
+  const licJson = await licResp.json().catch(() => ({}));
+  if (!licResp.ok || !licJson.Allowed) {
+    if ((licJson.message || "").toLowerCase().includes("expired")) {
+      return res.status(403).json({ ok:false, message:"license_expired" });
+    }
+    if ((licJson.message || "").toLowerCase().includes("device mismatch")) {
+      return res.status(403).json({ ok:false, message:"hwid_mismatch" });
+    }
+    if ((licJson.message || "").toLowerCase().includes("username mismatch")) {
+      return res.status(403).json({ ok:false, message:"username_invalid" });
+    }
+    return res.status(403).json({ ok:false, message:"license_invalid" });
+  }
+
+  return res.json({ ok: true, expiresAt: licJson.expiresAt || null });
+});
+
 // ============ Start ============
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, "0.0.0.0", () => console.log(`License server listening on ${PORT}`));
+const PUBLIC_BASE = process.env.PUBLIC_BASE_URL || `http://127.0.0.1:${PORT}`;
 
-// ============ Keep-alive (STAŁY URL) ============
+app.listen(PORT, "0.0.0.0", () => console.log(`Server listening on ${PORT} (PUBLIC_BASE=${PUBLIC_BASE})`));
+
+// ============ Keep-alive ============
 const KEEPALIVE_URLS = [
   "https://hwid-servers.onrender.com"
 ];
@@ -201,10 +317,9 @@ async function pingOnce(url) {
 }
 
 if (KEEPALIVE_URLS.length > 0 && typeof fetch !== "undefined") {
-  console.log(`[KEEP-ALIVE] enabled (hardcoded): ${KEEPALIVE_URLS.join(", ")} | interval=${KEEPALIVE_INTERVAL_MS}ms`);
+  console.log(`[KEEP-ALIVE] enabled: ${KEEPALIVE_URLS.join(", ")} | interval=${KEEPALIVE_INTERVAL_MS}ms`);
   (async () => { for (const u of KEEPALIVE_URLS) await pingOnce(u); })();
   setInterval(() => { KEEPALIVE_URLS.forEach(u => pingOnce(u)); }, KEEPALIVE_INTERVAL_MS);
 } else {
   console.log("[KEEP-ALIVE] disabled (no URLs provided)");
 }
-
